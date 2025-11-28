@@ -1,3 +1,4 @@
+HEAD
 # Beej Mantra - AI-Powered Crop Farming Platform
 
 A modern, responsive frontend web application for an AI-powered Crop farming advisory platform. Built with React, TypeScript, and Tailwind CSS.
@@ -159,3 +160,7 @@ For support and questions, please contact:
 ---
 
 Built with ❤️ for Indian Crop farmers
+=======
+# BeejMantra
+AI-powered crop advisory platform offering real-time disease detection, yield prediction, market prices, weather alerts, and multilingual support. Helps farmers make data-driven decisions and sell produce directly with improved transparency and efficiency.
+0d866b55c1f94a79e73dc4ab3e762a71b4147979
