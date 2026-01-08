@@ -153,10 +153,7 @@ This project is licensed under the MIT License.
 
 ## Support
 
-For support and questions, please contact:
-- Email: support@beejmantra.com
-- Phone: +91 1800-123-4567
-
+🙋‍♂️ Contact For collaboration or feedback: 📧 kirishnasharma801@gmail.com 🔗 LinkedIn - https://in.linkedin.com/in/krishna-sharma-2629652a8
 ---
 
 Built with ❤️ for Indian Crop farmers
