@@ -99,20 +99,116 @@ def preprocess_image(image_path: str, target_size=(224, 224)) -> np.ndarray:
 LOW_CONF_THRESHOLD = 30.0
 
 
+def _extract_color_features(image_path: str) -> Dict[str, float]:
+    """
+    Compute simple, lighting‑robust color features used both for
+    (a) symptom validation and (b) healthy‑crop detection.
+
+    NOTE: These are deliberately conservative to avoid false positives.
+    """
+    img = Image.open(image_path).convert("RGB").resize((128, 128))
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+
+    mean_rgb = arr.mean(axis=(0, 1))
+    std_rgb = arr.std(axis=(0, 1))
+
+    brightness = float(mean_rgb.mean())
+    green_dominance = float(mean_rgb[1] - (mean_rgb[0] + mean_rgb[2]) / 2)
+    yellow_tint = float(mean_rgb[0] + mean_rgb[1] - mean_rgb[2] * 1.4)
+    dryness = float((1 - mean_rgb[1]) + mean_rgb[0]) / 2
+
+    return {
+        "mean_r": float(mean_rgb[0]),
+        "mean_g": float(mean_rgb[1]),
+        "mean_b": float(mean_rgb[2]),
+        "std_rgb": float(std_rgb.mean()),
+        "brightness": brightness,
+        "green_dominance": green_dominance,
+        "yellow_tint": yellow_tint,
+        "dryness": dryness,
+    }
+
+
+def _detect_symptoms(features: Dict[str, float]) -> Tuple[Dict[str, bool], float]:
+    """
+    Derive coarse symptom flags from color features.
+
+    This is used as a *gate* on CNN predictions so that we NEVER
+    output a high‑confidence disease when the leaf looks visually healthy.
+    """
+    brightness = features["brightness"]
+    green_dom = features["green_dominance"]
+    yellow_tint = features["yellow_tint"]
+    dryness = features["dryness"]
+    std_rgb = features["std_rgb"]
+
+    # Symptom heuristics – intentionally conservative.
+    discoloration = std_rgb > 0.20 and brightness < 0.85
+    chlorosis = yellow_tint > 0.16 and green_dom < 0.06
+    necrotic_spots = std_rgb > 0.26 and brightness < 0.7
+    wilting = dryness > 0.55 and brightness < 0.55
+    abnormal_texture = std_rgb > 0.23 and abs(green_dom) < 0.10
+
+    symptoms = {
+        "discoloration": discoloration,
+        "chlorosis": chlorosis,
+        "necrotic_spots": necrotic_spots,
+        "wilting": wilting,
+        "abnormal_texture": abnormal_texture,
+    }
+
+    # Health score: start high, subtract penalties for symptoms / stress.
+    health_score = 92.0
+    if discoloration:
+        health_score -= 12
+    if chlorosis:
+        health_score -= 18
+    if necrotic_spots:
+        health_score -= 18
+    if wilting:
+        health_score -= 15
+    if abnormal_texture:
+        health_score -= 10
+
+    # Penalise strong yellowing / dryness even if symptom flags are borderline.
+    health_score -= max(0.0, (yellow_tint - 0.10) * 80.0)
+    health_score -= max(0.0, (dryness - 0.5) * 50.0)
+
+    health_score = max(40.0, min(97.0, health_score))
+    return symptoms, health_score
+
+
 def predict_disease(image_path: str) -> Dict:
-    """Run prediction and return class/confidence. Prioritizes healthy class if present in top predictions."""
+    """
+    Two‑stage inference pipeline:
+
+    Step 1 (Binary health gate):
+      - Decide **Healthy vs Unhealthy** using CNN logits + color‑based symptom checks.
+
+    Step 2 (Disease classification, only if Unhealthy):
+      - If the leaf is classified as Unhealthy, run disease‑level interpretation
+        with strict confidence and symptom gating to avoid false positives.
+
+    This makes “Healthy Crop” a first‑class outcome instead of a fallback.
+    """
     try:
+        # ---- STEP 1: HEALTHY vs UNHEALTHY PRE‑CLASSIFICATION ----
+        # Compute color features + symptom flags for gating.
+        color_features = _extract_color_features(image_path)
+        symptoms, health_score = _detect_symptoms(color_features)
+        has_any_symptom = any(symptoms.values())
+
         model = _ensure_model_loaded()
         x = preprocess_image(image_path, target_size=(224, 224))  # Match training size
         probs = model.predict(x, verbose=0)[0]  # verbose=0 to suppress output
         
         idx_to_label = _ensure_class_map_loaded()
         
-        # Get top 3 predictions
-        top3_indices = np.argsort(probs)[-3:][::-1]  # Top 3, highest first
+        # Get top 3 predictions (model space)
+        top3_indices = np.argsort(probs)[-3:][::-1]
         top3_probs = probs[top3_indices]
-        
-        # Check if any healthy class is in top 3
+
+        # Track if model already has an explicit healthy class.
         healthy_idx = None
         healthy_conf = 0.0
         for idx, prob in zip(top3_indices, top3_probs):
@@ -121,32 +217,77 @@ def predict_disease(image_path: str) -> Dict:
                 healthy_idx = int(idx)
                 healthy_conf = float(prob) * 100.0
                 break
-        
-        # If healthy class found in top 3 with >40% confidence, prioritize it
-        if healthy_idx is not None and healthy_conf > 40.0:
-            cls_idx = healthy_idx
-            confidence = healthy_conf
-            raw_label = idx_to_label.get(cls_idx, f"Class_{cls_idx}")
-        else:
-            # Use top prediction
-            cls_idx = int(np.argmax(probs))
-            confidence = float(probs[cls_idx]) * 100.0
-            raw_label = idx_to_label.get(cls_idx, f"Class_{cls_idx}")
-        
+
+        # Model's top prediction
+        top_idx = int(np.argmax(probs))
+        top_conf = float(probs[top_idx]) * 100.0
+        raw_label = idx_to_label.get(top_idx, f"Class_{top_idx}")
+
+        # ---- Binary health decision ----
+        # A soft “health logit”: combine health_score (0‑100) with green dominance
+        # and explicit healthy‑class probability (if present).
+        healthy_score_model = healthy_conf if healthy_idx is not None else 0.0
+        healthy_score_combined = health_score + max(0.0, color_features["green_dominance"] * 90.0)
+        healthy_score_combined = (0.6 * healthy_score_combined) + (0.4 * healthy_score_model)
+
+        # A rough “unhealthy score”: driven by top disease confidence + symptom burden.
+        symptom_count = sum(1 for v in symptoms.values() if v)
+        unhealthy_score = top_conf + symptom_count * 8.0
+
+        is_unhealthy = (unhealthy_score >= healthy_score_combined) and (
+            has_any_symptom or top_conf >= 70.0
+        )
+
+        # ---- STEP 1 OUTPUT: If classified as HEALTHY, short‑circuit here ----
+        if not is_unhealthy:
+            # Confidence of health is high when unhealthy_score is low
+            # and visual features look normal.
+            yellow_penalty = max(0.0, (color_features["yellow_tint"] - 0.10) * 80.0)
+            conf_healthy = healthy_score_combined - yellow_penalty
+            conf_healthy = max(60.0, min(97.0, conf_healthy))
+            primary_crop = _derive_crop_from_label(
+                idx_to_label.get(healthy_idx, "") if healthy_idx is not None else raw_label
+            )
+            return {
+                "healthStatus": "healthy",
+                "prediction": "Healthy Crop",
+                "disease": "Healthy Crop",
+                "confidence": round(conf_healthy, 2),
+                "modelVersion": MODEL_VERSION,
+                "cropType": primary_crop,
+                "note": "No visible disease or nutrient deficiency detected",
+                "cause": "No disease patterns or stress symptoms detected in the image.",
+                "suggestions": "Continue regular irrigation, balanced fertiliser and field scouting.",
+                "prevention": "Maintain crop rotation, monitor pests and keep field weed‑free.",
+            }
+
+        # ---- STEP 2: DISEASE CLASSIFICATION (ONLY IF UNHEALTHY) ----
+        cls_idx = top_idx
+        confidence = top_conf
+
         display_name, crop_type, disease_key, is_healthy = _humanize_label(raw_label)
-        
+
+        # Very low confidence still falls back to heuristic model.
         if confidence < LOW_CONF_THRESHOLD:
             return fallback_prediction(image_path, reason=f"low_conf({confidence:.1f})", default_crop=crop_type)
-        
+
+        # Disease confidence capping rule:
+        # don't allow >80% unless multiple symptom flags are present.
+        if not is_healthy and confidence > 80.0 and symptom_count < 2:
+            confidence = 80.0
+
         rec = _recommendations_for_label(disease_key, is_healthy)
         return {
-            'disease': display_name,
-            'confidence': round(confidence, 2),
-            'modelVersion': MODEL_VERSION,
-            'cropType': crop_type,
-            'cause': rec['cause'],
-            'suggestions': rec['solution'],
-            'prevention': rec['prevention'],
+            "healthStatus": "unhealthy",
+            "prediction": display_name if not is_healthy else "Healthy Crop",
+            "disease": display_name,
+            "confidence": round(confidence, 2),
+            "modelVersion": MODEL_VERSION,
+            "cropType": crop_type,
+            "note": "" if not is_healthy else "No visible disease or nutrient deficiency detected",
+            "cause": rec["cause"],
+            "suggestions": rec["solution"],
+            "prevention": rec["prevention"],
         }
     except Exception as exc:
         return fallback_prediction(image_path, reason=f"ml_failure: {exc}")
@@ -208,8 +349,10 @@ def _humanize_label(label: str) -> Tuple[str, Optional[str], str, bool]:
 def _recommendations_for_label(disease_name: str, is_healthy: bool) -> Dict[str, str]:
     name = disease_name.lower()
     if is_healthy:
+        # Explicit healthy‑crop recommendations – surfaced both from CNN
+        # predictions and our heuristic fallback.
         return {
-            "cause": "No disease detected - Plant is healthy",
+            "cause": "No disease detected - Plant is healthy.",
             "solution": "Continue balanced nutrition, irrigation and weekly scouting.",
             "prevention": "Maintain crop rotation, monitor pests, keep fields weed-free."
         }
@@ -286,22 +429,50 @@ def fallback_prediction(image_path: str, reason: str = "", default_crop: Optiona
     hash_int = int(hashlib.md5(arr.tobytes()).hexdigest(), 16)
     rng_boost = (hash_int % 23) / 40.0
 
-    if std_rgb.mean() > 0.20:
+    # If the leaf is overall green and reasonably bright with very low yellowing,
+    # treat it as healthy instead of forcing a disease label.
+    if (
+        green_dominance > 0.04
+        and yellow_tint < 0.08
+        and dryness < 0.55
+        and 0.30 < brightness < 0.85
+    ):
+        # When the leaf looks normal green under reasonable lighting,
+        # we explicitly classify it as a healthy crop instead of
+        # forcing a synthetic disease label.
+        disease = "Healthy Crop"
+        library = {
+            "cause": "No clear disease patterns detected – foliage appears healthy and well nourished.",
+            "solution": "Maintain your current irrigation and nutrition schedule; continue routine scouting.",
+            "prevention": "Keep following good agronomy practices: crop rotation, balanced fertiliser and timely pest monitoring.",
+        }
+        base_conf = 82
+    elif std_rgb.mean() > 0.20:
         disease = "Leaf Spot"
-    elif yellow_tint > 0.12:
+        library = FALLBACK_LIBRARY[disease]
+        base_conf = 65
+    elif yellow_tint > 0.18:
         disease = "Nutrient Deficiency"
+        library = FALLBACK_LIBRARY[disease]
+        base_conf = 67
     elif dryness > 0.55 and brightness < 0.45:
         disease = "Leaf Blight"
+        library = FALLBACK_LIBRARY[disease]
+        base_conf = 66
     elif green_dominance < -0.08 and mean_rgb[0] > 0.4:
         disease = "Rust"
+        library = FALLBACK_LIBRARY[disease]
+        base_conf = 66
     else:
         disease = "Powdery Mildew"
+        library = FALLBACK_LIBRARY[disease]
+        base_conf = 64
 
-    library = FALLBACK_LIBRARY[disease]
-    confidence = 65 + int((abs(green_dominance) + std_rgb.mean() + rng_boost) * 35)
-    confidence = max(62, min(confidence, 93))
+    confidence = base_conf + int((abs(green_dominance) + std_rgb.mean() + rng_boost) * 20)
+    confidence = max(60, min(confidence, 93))
 
     return {
+        "prediction": disease,
         "disease": disease,
         "confidence": confidence,
         "modelVersion": f"heuristic_fallback ({reason or 'no_model'})",

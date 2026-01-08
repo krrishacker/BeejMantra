@@ -6,14 +6,33 @@ const { analyzeCropImageWithML } = require('./mlImageService');
 /**
  * Analyze crop image for health issues
  * Tries ML model first, falls back to rule-based analysis if ML service unavailable
+ * Location is used ONLY for environmental context in recommendations, NOT for disease detection
  */
-async function analyzeCropImage(imagePath, cropType = 'Unknown') {
-  // Try ML model first
+async function analyzeCropImage(imagePath, cropType = 'Unknown', cropStage = null, latitude = null, longitude = null) {
+  // Try ML model first with all features for crop-specific learning
   try {
-    const mlResult = await analyzeCropImageWithML(imagePath, cropType);
+    // Prepare weather and soil data if available (can be fetched from location)
+    // For now, pass null - these can be enhanced to fetch from weather service
+    const weather = null; // Can be enhanced to fetch from weather service using lat/lon
+    const soil = null; // Can be enhanced to fetch from soil service
+    
+    // Pass all features to ML model for crop-specific learning
+    const mlResult = await analyzeCropImageWithML(
+      imagePath, 
+      cropType, 
+      cropStage, 
+      latitude, 
+      longitude,
+      weather,
+      soil
+    );
+    
     if (mlResult) {
+      // ML model now learns crop-specific behavior, so minimal post-processing
+      // Only add location context to recommendations (not for disease detection)
+      const finalResult = addLocationContext(mlResult, latitude, longitude);
       return {
-        ...mlResult,
+        ...finalResult,
         timestamp: new Date().toISOString(),
         method: 'ml_model'
       };
@@ -23,13 +42,97 @@ async function analyzeCropImage(imagePath, cropType = 'Unknown') {
   }
   
   // Fall back to rule-based analysis
-  return analyzeCropImageRuleBased(imagePath);
+  const ruleBasedResult = await analyzeCropImageRuleBased(imagePath, cropStage);
+  // Add location-based environmental context to recommendations only
+  return addLocationContext(ruleBasedResult, latitude, longitude);
+}
+
+/**
+ * Add location-based environmental context to recommendations
+ * Location is used ONLY for environmental risk factors, NOT for disease detection or confidence
+ */
+function addLocationContext(analysis, latitude, longitude) {
+  if (!analysis || (!latitude || !longitude)) return analysis;
+  
+  const adjusted = { ...analysis };
+  
+  // Only modify recommendations with location context, never disease detection or confidence
+  if (adjusted.recommendations && adjusted.recommendations.length > 0) {
+    // Add location-aware environmental guidance
+    adjusted.recommendations.push('In your region, monitor for region-specific pest and disease patterns. Consult local agricultural extension services for area-specific guidance.');
+  }
+  
+  return adjusted;
+}
+
+/**
+ * Adjust analysis results based on crop stage
+ */
+function adjustAnalysisByStage(analysis, cropStage) {
+  if (!cropStage || !analysis) return analysis;
+  
+  const adjusted = { ...analysis };
+  const stageLower = cropStage.toLowerCase();
+  
+  // Adjust severity and advisory text based on crop stage
+  // Early stages (Seedling) are more sensitive, later stages (Fruiting) may tolerate some issues
+  if (stageLower.includes('seedling')) {
+    // Seedling stage: More sensitive, adjust severity descriptions
+    if (adjusted.issues && adjusted.issues.length > 0) {
+      adjusted.issues = adjusted.issues.map(issue => {
+        if (issue.severity === 'moderate') {
+          return { ...issue, severity: 'high', description: issue.description + ' Early stage crops are more vulnerable. Immediate attention recommended.' };
+        }
+        return { ...issue, description: issue.description + ' Early stage crops require extra care.' };
+      });
+      // Adjust health status based on severity change (not confidence)
+      if (adjusted.healthStatus === 'moderate') {
+        adjusted.healthStatus = 'critical';
+      }
+    }
+    // Add stage-specific recommendations
+    if (adjusted.recommendations) {
+      adjusted.recommendations.unshift('Seedling stage requires extra care. Monitor closely for early disease signs.');
+    }
+  } else if (stageLower.includes('fruiting') || stageLower.includes('grain')) {
+    // Fruiting/Grain Filling stage: Critical for yield, but may tolerate some leaf issues
+    if (adjusted.issues && adjusted.issues.length > 0) {
+      adjusted.issues = adjusted.issues.map(issue => {
+        if (issue.type !== 'pest_damage' && issue.severity === 'high') {
+          return { ...issue, description: issue.description + ' During grain filling, focus on protecting developing grains.' };
+        }
+        return issue;
+      });
+    }
+    // Add stage-specific recommendations
+    if (adjusted.recommendations) {
+      adjusted.recommendations.unshift('Grain filling stage: Protect developing grains from pests and diseases.');
+    }
+  } else if (stageLower.includes('flowering')) {
+    // Flowering stage: Critical period, maintain health
+    if (adjusted.issues && adjusted.issues.length > 0) {
+      adjusted.issues = adjusted.issues.map(issue => {
+        return { ...issue, description: issue.description + ' Flowering stage is critical for pollination and yield formation.' };
+      });
+    }
+    // Add stage-specific recommendations
+    if (adjusted.recommendations) {
+      adjusted.recommendations.unshift('Flowering stage: Ensure optimal conditions for pollination.');
+    }
+  } else if (stageLower.includes('vegetative')) {
+    // Vegetative stage: Growth period, can recover from some issues
+    if (adjusted.recommendations) {
+      adjusted.recommendations.unshift('Vegetative stage: Focus on maintaining healthy growth and preventing disease spread.');
+    }
+  }
+  
+  return adjusted;
 }
 
 /**
  * Rule-based analysis (fallback when ML model unavailable)
  */
-async function analyzeCropImageRuleBased(imagePath) {
+async function analyzeCropImageRuleBased(imagePath, cropStage = null) {
   try {
     // Read image metadata
     const metadata = await sharp(imagePath).metadata();
@@ -178,7 +281,7 @@ async function analyzeCropImageRuleBased(imagePath) {
       recommendations.push('Regular monitoring recommended to maintain crop health.');
     }
     
-    return {
+    const result = {
       healthStatus,
       confidence: Math.round(confidence),
       issues,
@@ -193,6 +296,9 @@ async function analyzeCropImageRuleBased(imagePath) {
       timestamp: new Date().toISOString(),
       method: 'rule_based'
     };
+    
+    // Adjust based on crop stage (location context will be added by caller)
+    return adjustAnalysisByStage(result, cropStage);
   } catch (error) {
     console.error('Image analysis error:', error);
     throw new Error('Failed to analyze image: ' + error.message);

@@ -665,9 +665,13 @@ app.post('/api/crop/analyze-image', upload.single('image'), async (req, res) => 
 
     const imagePath = req.file.path;
     const cropType = req.body.cropType || 'Unknown';
+    const cropStage = req.body.cropStage || null;
+    const latitude = req.body.latitude ? parseFloat(req.body.latitude) : null;
+    const longitude = req.body.longitude ? parseFloat(req.body.longitude) : null;
     
     // Analyze the image (will try ML model first, fall back to rule-based)
-    const analysis = await analyzeCropImage(imagePath, cropType);
+    // Location is used ONLY for environmental context, NOT for disease detection
+    const analysis = await analyzeCropImage(imagePath, cropType, cropStage, latitude, longitude);
     
     // Clean up uploaded file
     try {

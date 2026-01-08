@@ -3,9 +3,10 @@ const axios = require('axios');
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://localhost:5001';
 
 /**
- * Analyze crop image using ML service
+ * Analyze crop image using ML service with multi-modal features
+ * Passes all features (crop type, stage, weather, soil) for crop-specific learning
  */
-async function analyzeCropImageWithML(imagePath, cropType = 'Unknown') {
+async function analyzeCropImageWithML(imagePath, cropType = 'Unknown', cropStage = null, latitude = null, longitude = null, weather = null, soil = null) {
   try {
     const FormData = require('form-data');
     const fs = require('fs');
@@ -13,6 +14,30 @@ async function analyzeCropImageWithML(imagePath, cropType = 'Unknown') {
     const formData = new FormData();
     formData.append('image', fs.createReadStream(imagePath));
     formData.append('cropType', cropType);
+    
+    // Add crop stage if available
+    if (cropStage) {
+      formData.append('cropStage', cropStage);
+    }
+    
+    // Add weather features if available
+    if (weather) {
+      if (weather.temp !== undefined) formData.append('temperature', weather.temp.toString());
+      if (weather.humidity !== undefined) formData.append('humidity', weather.humidity.toString());
+      if (weather.rain !== undefined) formData.append('rainfall', weather.rain.toString());
+    }
+    
+    // Add location for weather lookup if needed
+    if (latitude !== null && longitude !== null) {
+      formData.append('latitude', latitude.toString());
+      formData.append('longitude', longitude.toString());
+    }
+    
+    // Add soil features if available
+    if (soil) {
+      if (soil.ph !== undefined) formData.append('soilPh', soil.ph.toString());
+      if (soil.moisture !== undefined) formData.append('soilMoisture', soil.moisture.toString());
+    }
     
     const response = await axios.post(`${ML_SERVICE_URL}/analyze`, formData, {
       headers: formData.getHeaders(),
